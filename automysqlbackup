@@ -9,7 +9,7 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -31,6 +31,7 @@ let "filename_flag_gz=0x02"
 let "filename_flag_bz2=0x04"
 let "filename_flag_diff=0x08"
 let "filename_flag_xz=0x10"
+let "filename_flag_zst=0x20"
 # END _flags
 
 # BEGIN _errors_notifications
@@ -66,7 +67,7 @@ let "N_backup_local_nofiles=0x20"
 # @deps:	(none)
 load_default_config() {
   CONFIG_configfile="/etc/automysqlbackup/automysqlbackup.conf"
-  CONFIG_backup_dir='/var/backup/db'
+  CONFIG_backup_dir='/var/backups/db'
   CONFIG_multicore='yes'
   CONFIG_multicore_threads=2
   CONFIG_do_monthly="01"
@@ -83,9 +84,11 @@ load_default_config() {
   CONFIG_mysql_dump_socket=''
   CONFIG_mysql_dump_create_database='no'
   CONFIG_mysql_dump_add_drop_database='no'
+  CONFIG_mysql_dump_create_event='yes'
   CONFIG_mysql_dump_use_separate_dirs='yes'
   CONFIG_mysql_dump_compression='gzip'
   CONFIG_mysql_dump_commcomp='no'
+  CONFIG_mysql_dump_hex_blob='no'
   CONFIG_mysql_dump_latest='no'
   CONFIG_mysql_dump_latest_clean_filenames='no'
   CONFIG_mysql_dump_max_allowed_packet=''
@@ -113,7 +116,7 @@ load_default_config() {
 }
 
 mysql_commands() {
-  VERSION=`mysql -V | grep -oE "[0-9]+\.[0-9]+\.[0-9]+"`
+  VERSION=`mysql -V | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1`
   NODOT_VER=`echo $VERSION | sed -${sed_Regex} 's/\.//g'`
   if [ "${CONFIG_mysql_dump_encrypted_login}" = "yes" ]; then
     export MYSQLDUMP="mysqldump --login-path=$CONFIG_mysql_dump_login_path"
@@ -126,7 +129,7 @@ mysql_commands() {
     export MYSQLDUMP="mysqldump --user=${CONFIG_mysql_dump_username} --password=${CONFIG_mysql_dump_password} --host=${CONFIG_mysql_dump_host}";
     export MYSQLSHOW="mysqlshow --user=${CONFIG_mysql_dump_username} --password=${CONFIG_mysql_dump_password} --host=${CONFIG_mysql_dump_host}";
     export MYSQL="mysql --user=${CONFIG_mysql_dump_username} --password=${CONFIG_mysql_dump_password} --host=${CONFIG_mysql_dump_host}";
-  fi   
+  fi
 }
 
 # @return:	true, if variable is set; else false
@@ -177,7 +180,7 @@ mail_cleanup () {
 							  'bunzip2 <mail_attachment_2011-08-13_13h15m.tar.bz2 | pax -rv' to extract the content."
 					  for ((j=0;j<"${#files[@]}";j++)); do
 						if [[ "x$CONFIG_mail_use_uuencoded_attachments" = "xyes" ]]; then
-						  if (( $j = 0 )); then
+						  if (( $j == 0 )); then
 							cat "$log_file" > "$temp"
 							uuencode "$j" "$j" >> "$temp"
 						  else
@@ -274,6 +277,22 @@ gzip_compression() {
   fi
 }
 
+# @info:	zstd compression
+zstd_compression() {
+  var=("$@")
+  re='^[0-9]*$'
+  if [[ "x$CONFIG_multicore" = 'xyes' ]]; then
+	  if [[ "x$CONFIG_multicore_threads" != 'xauto' ]] && [[ "x$CONFIG_multicore_threads" =~ $re ]]; then
+		  var=( "-T${CONFIG_multicore_threads}" "${var[@]}" )
+          else
+		  var=( "-T0" "${var[@]}" )
+	  fi
+	  zstd "${var[@]}"
+  else
+	  zstd "${var[@]}"
+  fi
+}
+
 # @info:	xz compression
 xz_compression() {
   var=("$@")
@@ -328,9 +347,9 @@ files_postprocessing () {
 	# -> CONFIG_encrypt
 	[[ "${CONFIG_encrypt}" = "yes" && "${CONFIG_encrypt_password}" ]] && {
 	  if (( $CONFIG_dryrun )); then
-	    printf 'dry-running: openssl enc -aes-256-cbc -e -in %s -out %s.enc -pass pass:%s\n' ${1} ${1} "${CONFIG_encrypt_password}"
+	    printf 'dry-running: openssl enc -aes-256-cbc -pbkdf2 -iter 1000 -e -in %s -out %s.enc -pass pass:%s\n' ${1} ${1} "${CONFIG_encrypt_password}"
 	  else
-	    openssl enc -aes-256-cbc -e -in ${1} -out ${1}.enc -pass pass:"${CONFIG_encrypt_password}"
+	    openssl enc -aes-256-cbc -pbkdf2 -iter 1000 -e -in ${1} -out ${1}.enc -pass pass:"${CONFIG_encrypt_password}"
 	    if (( $? == 0 )); then
 		  if rm ${1} 2>&1; then
 		    echo "Successfully encrypted archive as ${1}.enc"
@@ -352,7 +371,7 @@ files_postprocessing () {
 		if (( $CONFIG_dryrun )); then
 		  printf 'dry-running: cp -al %s.enc %s/latest/\n' "${1}" "${CONFIG_backup_dir}"
 		else
-		  cp -al "${1}${suffix}.enc" "${CONFIG_backup_dir}"/latest/
+		  cp -al "${1}.enc" "${CONFIG_backup_dir}"/latest/
 		fi
 	  else
 		if (( $CONFIG_dryrun )); then
@@ -455,6 +474,9 @@ backup_local_files () {
 	  'xz')
 	    echo "tar -cJvf ${1}${suffix} ${CONFIG_backup_local_files[@]}";
 	    ;;
+	  'zstd')
+	    echo "tar -I zstd -cvf ${1}${suffix} ${CONFIG_backup_local_files[@]}";
+	    ;;
 	  *)
 	    echo "tar -cvf ${1}${suffix} ${CONFIG_backup_local_files[@]}";
 	    ;;
@@ -475,6 +497,10 @@ backup_local_files () {
 	    tar -cJvf "${1}${suffix}" "${CONFIG_backup_local_files[@]}";
 	    return $?
 	    ;;
+	  'zstd')
+	    tar -I zstd -cvf "${1}${suffix}" "${CONFIG_backup_local_files[@]}";
+	    return $?
+	    ;;
 	  *)
 	    tar -cvf "${1}${suffix}" "${CONFIG_backup_local_files[@]}";
 	    return $?
@@ -492,7 +518,7 @@ backup_local_files () {
 # @deps:	load_default_config
 parse_configuration () {
     # OPT string for use with mysqldump ( see man mysqldump )
-    opt=( '--quote-names' '--opt' '--events' '--skip-add-locks' )
+    opt=( '--quote-names' '--opt' '--skip-add-locks' '--quick' )
 
     # OPT string for use with mysql (see man mysql )
     mysql_opt=()
@@ -532,6 +558,10 @@ parse_configuration () {
 	  opt=( "${opt[@]}" "--max_allowed_packet=${CONFIG_mysql_dump_max_allowed_packet}" )
 	  opt_fullschema=( "${opt_fullschema[@]}" "--max_allowed_packet=${CONFIG_mysql_dump_max_allowed_packet}" )
     }
+    [[ "${CONFIG_mysql_dump_hex_blob}" = "yes" ]]		&& {
+	  opt=( "${opt[@]}" '--hex-blob' )
+	  opt_fullschema=( "${opt_fullschema[@]}" '--hex-blob' )
+    }
     [[ "${CONFIG_mysql_dump_socket}" ]]			&& {
 	  opt=( "${opt[@]}" "--socket=${CONFIG_mysql_dump_socket}" )
 	  mysql_opt=( "${mysql_opt[@]}" "--socket=${CONFIG_mysql_dump_socket}" )
@@ -559,7 +589,11 @@ parse_configuration () {
     if [[ "${CONFIG_mysql_dump_add_drop_database}" = "yes" ]]; then
       opt=( "${opt[@]}" '--add-drop-database' )
     fi
-      
+
+    if [[ "${CONFIG_mysql_dump_create_event}" = "yes" ]]; then
+      opt=( "${opt[@]}" '--events' )
+    fi
+
 	# if differential backup is active and the specified rotation is smaller than 21 days, set it to 21 days to ensure, that
 	# master backups aren't deleted.
 	if [[ "x$CONFIG_mysql_dump_differential" = "xyes" ]] && (( ${CONFIG_rotation_daily} < 21 )); then
@@ -571,6 +605,7 @@ parse_configuration () {
       'gzip')	suffix='.gz';;
       'bzip2')	suffix='.bz2';;
       'xz')	suffix='.xz';;
+      'zstd')	suffix='.zst';;
       *)		suffix='';;
     esac
     # <- determine suffix
@@ -612,6 +647,9 @@ dbstatus() {
 	'xz')
 	  echo "dry-running: $MYSQLSHOW ${opt_dbstatus[@]} | xz_compression > ${1}${suffix}";
 	  ;;
+	'zstd')
+	  echo "dry-running: $MYSQLSHOW ${opt_dbstatus[@]} | zstd_compression > ${1}${suffix}";
+	  ;;
 	*)
 	  echo "dry-running: $MYSQLSHOW ${opt_dbstatus[@]} > ${1}${suffix}";
 	  ;;
@@ -629,6 +667,10 @@ dbstatus() {
 	  ;;
 	'xz')
 	  $MYSQLSHOW "${opt_dbstatus[@]}" | xz_compression > "${1}${suffix}";
+	  return $?
+	  ;;
+	'zstd')
+	  $MYSQLSHOW "${opt_dbstatus[@]}" | zstd_compression > "${1}${suffix}";
 	  return $?
 	  ;;
 	*)
@@ -655,6 +697,9 @@ fullschema () {
 	'xz')
 	  echo "dry-running: $MYSQLDUMP ${opt_fullschema[@]} | xz_compression > ${1}${suffix}";
 	  ;;
+	'zstd')
+	  echo "dry-running: $MYSQLDUMP ${opt_fullschema[@]} | zstd_compression > ${1}${suffix}";
+	  ;;
 	*)
 	  echo "dry-running: $MYSQLDUMP ${opt_fullschema[@]} > ${1}${suffix}";
 	  ;;
@@ -672,6 +717,10 @@ fullschema () {
 	  ;;
 	'xz')
 	  $MYSQLDUMP "${opt_fullschema[@]}" | xz_compression > "${1}${suffix}";
+	  return $?
+	  ;;
+	'zstd')
+	  $MYSQLDUMP "${opt_fullschema[@]}" | zstd_compression > "${1}${suffix}";
 	  return $?
 	  ;;
 	*)
@@ -722,7 +771,7 @@ process_dbs() {
   manifest_file="${CONFIG_backup_dir}/${subfolder}${subsubfolder}/Manifest"
   fname="${CONFIG_backup_dir}/${subfolder}${subsubfolder}/${prefix}${name}_${datetimestamp}${midfix}${extension}"
 
-  (( $CONFIG_debug )) && echo "DEBUG: process_dbs >> Setting manifest file to: ${manifest_file}" 
+  (( $CONFIG_debug )) && echo "DEBUG: process_dbs >> Setting manifest file to: ${manifest_file}"
 
   if (( $multipledbs )); then
 	# multiple databases
@@ -746,17 +795,18 @@ process_dbs() {
 
 	  # -> generate diff file
 	  let "filename_flags=0x00"
-	  
+
 # 	  ## -> get latest differential manifest entry for specified db
 # 	  if get_latest_manifest_entry_for_db "$db" 1; then
 # 		pid="${manifest_entry[2]}"
-# 		# filename format: prefix_db_YYYY-MM-DD_HHhMMm_[A-Za-z0-9]{8}(.sql|.diff)(.gz|.bz2|.xz)(.enc)
+# 		# filename format: prefix_db_YYYY-MM-DD_HHhMMm_[A-Za-z0-9]{8}(.sql|.diff)(.gz|.bz2|.xz|.zst)(.enc)
 # 		FileStub=${manifest_entry[0]%.@(sql|diff)*}
 # 		FileExt=${manifest_entry[0]#"$FileStub"}
 # 		re=".*\.enc.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_encrypted"
 # 		re=".*\.gz.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_gz"
 # 		re=".*\.bz2.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_bz2"
 # 		re=".*\.xz.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_xz"
+# 		re=".*\.zst.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_zst"
 # 		re=".*\.diff.*";	[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_diff"
 # 		manifest_latest_diff_entry=("${manifest_entry[@]}")
 # 	  else	# no entries in manifest
@@ -768,13 +818,14 @@ process_dbs() {
 	  # Create a differential backup if a master entry in the manifest exists, it isn't the day we do weekly master backups or the master file we fetched is already from today.
 	  if get_latest_manifest_entry_for_db "$db" 0 && ( (( ${date_dayno_of_week} != ${CONFIG_do_weekly} )) || [[ "${manifest_entry[0]}" = *_$(date +%Y-%m-%d)_* ]] ); then
 		pid="${manifest_entry[2]}"
-		# filename format: prefix_db_YYYY-MM-DD_HHhMMm_[A-Za-z0-9]{8}(.sql|.diff)(.gz|.bz2|xz)(.enc)
+		# filename format: prefix_db_YYYY-MM-DD_HHhMMm_[A-Za-z0-9]{8}(.sql|.diff)(.gz|.bz2|,xz|.zst)(.enc)
 		FileStub="${manifest_entry[0]%.@(sql|diff)*}"
 		FileExt="${manifest_entry[0]#"$FileStub"}"
 		re=".*\.enc.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_encrypted"
 		re=".*\.gz.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_gz"
 		re=".*\.bz2.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_bz2"
 		re=".*\.xz.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_xz"
+		re=".*\.zst.*";		[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_zst"
 		re=".*\.diff.*";	[[ "$FileExt" =~ $re ]] && let "filename_flags|=$filename_flag_diff"
 		manifest_latest_master_entry=("${manifest_entry[@]}")
 	  else	# no entries in manifest
@@ -802,6 +853,9 @@ process_dbs() {
 		  ;;
 		'xz')
 		  $MYSQLDUMP "${opt[@]}" "$@" | xz_compression > "$cfname";
+		  ;;
+		'zstd')
+		  $MYSQLDUMP "${opt[@]}" "$@" | zstd_compression > "$cfname";
 		  ;;
 		*)
 		  $MYSQLDUMP "${opt[@]}" "$@" > "$cfname";
@@ -848,6 +902,17 @@ process_dbs() {
 			diff "${manifest_latest_master_entry[0]}" <($MYSQLDUMP "${opt[@]}" "$@") | xz_compression > "$cfname";
 		  fi
 		  ;;
+		'zstd')
+		  if (( $filename_flags & $filename_flag_zst )); then
+			diff <(zstd_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") | xz_compression > "$cfname";
+		  elif (( $filename_flags & $filename_flag_bz2 )); then
+			diff <(bzip2_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") | xz_compression > "$cfname";
+		  elif (( $filename_flags & $filename_flag_xz )); then
+			diff <(xz_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") | xz_compression > "$cfname";
+		  else
+			diff "${manifest_latest_master_entry[0]}" <($MYSQLDUMP "${opt[@]}" "$@") | xz_compression > "$cfname";
+		  fi
+		  ;;
 		*)
 		  if (( $filename_flags & $filename_flag_gz )); then
 			diff <(gzip_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") > "$cfname";
@@ -855,13 +920,15 @@ process_dbs() {
 			diff <(bzip2_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") > "$cfname";
 		  elif (( $filename_flags & $filename_flag_xz )); then
 			diff <(xz_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") > "$cfname";
+		  elif (( $filename_flags & $filename_flag_zst )); then
+			diff <(zstd_compression -dc "${manifest_latest_master_entry[0]}") <($MYSQLDUMP "${opt[@]}" "$@") > "$cfname";
 		  else
 			diff "${manifest_latest_master_entry[0]}" <($MYSQLDUMP "${opt[@]}" "$@") > "$cfname";
 		  fi
 		  ;;
 		esac
 		add_manifest_entry "$manifest_file" "$cfname" "$pid" "$db" && parse_manifest "$manifest_file" && cp -al "$cfname" "${manifest_latest_master_entry[0]}" "${CONFIG_backup_dir}"/latest/ && echo "generated $cfname" && return 0 || return 1
-		
+
 	  fi
 	  # <- generate diff filename
 
@@ -878,14 +945,21 @@ process_dbs() {
 		'xz')
 		  echo "dry-running: $MYSQLDUMP ${opt[@]} $@ | xz_compression > ${cfname}"
 		  ;;
+		'zstd')
+		  echo "dry-running: $MYSQLDUMP ${opt[@]} $@ | zstd_compression > ${cfname}"
+		  ;;
 		*)
 		  echo "dry-running: $MYSQLDUMP ${opt[@]} $@ > ${cfname}"
 		  ;;
 		esac
 		return 0;
 	  else
-		max_execution_time=`$MYSQL -B --skip-column-names -e "show variables like '%max_execution_time%';" | awk '{print $2}'`
-		$MYSQL -e "SET GLOBAL max_execution_time=0;"
+        if [ $NODOT_VER = "57" ]; then
+          max_execution_time=`$MYSQL -B --skip-column-names -e "show variables like '%max_execution_time%';" | awk '{print $2}'`
+          max_statement_time=`$MYSQL -B --skip-column-names -e "show variables like '%max_statement_time%';" | awk '{print $2}'`
+          $MYSQL -e "SET GLOBAL max_statement_time=0;"
+          $MYSQL -e "SET GLOBAL max_execution_time=0;"
+        fi
 		case "${CONFIG_mysql_dump_compression}" in
 		'gzip')
 		  $MYSQLDUMP "${opt[@]}" "$@" | gzip_compression > "${cfname}"
@@ -899,16 +973,23 @@ process_dbs() {
 		  $MYSQLDUMP "${opt[@]}" "$@" | xz_compression > "${cfname}"
 		  ret=$?
 		  ;;
+		'zstd')
+		  $MYSQLDUMP "${opt[@]}" "$@" | zstd_compression > "${cfname}"
+		  ret=$?
+		  ;;
 		*)
 		  $MYSQLDUMP "${opt[@]}" "$@" > "${cfname}"
 		  ret=$?
 		  ;;
 		esac
-		$MYSQL -e "SET GLOBAL max_execution_time=$max_execution_time;"
+        if [ $NODOT_VER = "57" ]; then
+		  $MYSQL -e "SET GLOBAL max_execution_time=$max_execution_time;"
+		  $MYSQL -e "SET GLOBAL max_statement_time=$max_statement_time;"
+        fi
 	  fi
 
   fi
-  
+
 
   if (( $ret == 0 )); then
 	  echo "Rotating $(( ${rotation}/${rotation_divisor} )) ${rotation_string} backups for ${name}"
@@ -1131,13 +1212,21 @@ check_dependencies () {
 		    CONFIG_multicore='no' # turn off multicore support, since the program isn't there
 		    echo "WARNING: Turning off multicore support, since xz isn't there."
 		  fi
+		elif [[ "x$CONFIG_mysql_dump_compression" = 'xzstd' ]]; then
+		  if type zstd &>/dev/null; then
+		    echo "zstd ... found."
+		  else
+		    CONFIG_multicore='no' # turn off multicore support, since the program isn't there
+		    echo "WARNING: Turning off multicore support, since zstd isn't there."
+		  fi
 		fi
 
 	else
 		[[ "x$CONFIG_mysql_dump_compression" = 'xbzip2' ]] && dependencies=("${dependencies[@]}" 'bzip2' )
 		[[ "x$CONFIG_mysql_dump_compression" = 'xgzip' ]] && dependencies=("${dependencies[@]}" 'gzip' )
 		[[ "x$CONFIG_mysql_dump_compression" = 'xxz' ]] && dependencies=("${dependencies[@]}" 'xz' )
-	fi	  
+		[[ "x$CONFIG_mysql_dump_compression" = 'xzstd' ]] && dependencies=("${dependencies[@]}" 'zstd' )
+	fi
 
     if [[ "x$CONFIG_mailcontent" = 'xlog' || "x$CONFIG_mailcontent" = 'xquiet' ]]; then
       dependencies=( "${dependencies[@]}" 'mail' )
@@ -1322,7 +1411,7 @@ parse_manifest() {
 		(( $CONFIG_debug )) && echo "Found multiple entries with the same filename. Removing all but the first-found entry from manifest."
 		# remove all entries with this filename and add a new one based on the values of the item already in the array
 		rm_manifest_entry_by_filename "$1" "${manifest_array[i]}" 1 && add_manifest_entry "$1" "${manifest_array[i]}" "${manifest_array[i+3]}"
-		continue 2	# the original entry, to which we compared, is already in the manifest_array; no matter if this is resolved or not, we don't 
+		continue 2	# the original entry, to which we compared, is already in the manifest_array; no matter if this is resolved or not, we don't
 					# need to add this entry to the manifest_array
 	  elif [[ "x${manifest_array[i+1]}" = "x${line_arr[2]}" ]]; then	# found entry with different filename but same md5sum - file copied and renamed?!
 		if [[ ! -s "${line_arr[0]}" ]]; then # empty file - don't start to compare md5sums ...
@@ -1331,7 +1420,7 @@ parse_manifest() {
 		  (( $CONFIG_debug )) && echo "Found multiple entries with the same md5sum but different filename."
 		  (( $CONFIG_debug )) && echo -e ">> fname_manifest:\t${manifest_array[i]}\t${manifest_array[i+1]}\n>> fname_line:\t\t${line_arr[0]}\t${line_arr[2]}"
 		  if [[ "x${line_arr[6]}" != "x0" ]]; then
-			if [[ "x${manifest_array[i+3]}" = "x${line_arr[6]}" ]]; then	# parent id is the same; TODO inform user of this predicament and suggest solution 
+			if [[ "x${manifest_array[i+3]}" = "x${line_arr[6]}" ]]; then	# parent id is the same; TODO inform user of this predicament and suggest solution
 			  manifest_entries_user_action_required=( "${manifest_entries_user_action_required[@]}" "$1" "${manifest_array[i]}" "The file has an identical copy with the same parent id. If you don't know why it exists, it is safe to remove it." )
 			  continue 2
 			else
@@ -1348,7 +1437,7 @@ parse_manifest() {
       manifest_array[(n-1)*${fields}+i/2]="${line_arr[i]}"
       #echo "manifest array key $((($n-1)*4+$i/2)) with value ${line_arr[i]}"
     done
-    
+
     ((n++))
   done < <(sort -t $'\t' -k"1" "$1")
   (( $CONFIG_debug )) && echo "<<<<<<< # manifest entries: $((${#manifest_array[@]}/$fields))"
@@ -1490,7 +1579,7 @@ get_latest_manifest_entry_for_db() {
 }
 
 # @params:	manifest_file	filename/md5sum/id/rel_id	[1(=don't parse manifest after finished)]
-# if second parameters 
+# if second parameters
 #
 #	lock manifest -> use awk, print all lines that don't have second parameter at the appropriate field -> unlock manifest
 #	param3=0 -> parse manifest
@@ -1592,7 +1681,7 @@ extended_select() {
 			echo -e "$i) [ ]\t${list[i]}"
 		  fi
 		done
-		
+
 		echo -e "$i)\tDONE"
 		done_id=$i
 
@@ -1743,7 +1832,7 @@ extended_select() {
 	for i in "${selection[@]}"; do
 	  [[ "x$i" != "x$done_id" ]] && { extended_select_return=("${extended_select_return[@]}" "${list[i]}"); extended_select_return_id=("${extended_select_return_id[@]}" "$i"); }
 	done
-	
+
 }
 
 # END _functions
@@ -1769,7 +1858,7 @@ method_backup () {
 
 	# load mysql commands
 	mysql_commands
-	
+
 	(( $CONFIG_dryrun )) && {
 	  echo "NOTE: We are dry-running. That means, that the script just shows you what it would do, if it were operating normally."
 	  echo "THE PRINTED COMMANDS CAN'T BE COPIED AND EXECUTED IF THERE ARE SPECIAL CHARACTERS, SPACES, ETC. IN THERE THAT WOULD NEED TO BE PROPERLY QUOTED IN ORDER TO WORK. THESE WERE CORRECTLY QUOTED FOR THE OUTPUT COMMAND, BUT CAN'T BE SEEN NOW."
@@ -1778,7 +1867,7 @@ method_backup () {
 
 	export LC_ALL=C
 	PROGNAME=`basename $0`
-	PATH=${PATH}:/usr/local/bin:/usr/bin:/bin:/usr/local/mysql/bin 
+	PATH=${PATH}:/usr/local/bin:/usr/bin:/bin:/usr/local/mysql/bin
 	version=3.0
 	fields=5 # manifest fields
 
@@ -1824,7 +1913,7 @@ method_backup () {
 	echo "======================================================================"
 	echo "AutoMySQLBackup version ${version}"
 	echo "http://sourceforge.net/projects/automysqlbackup/"
-	echo 
+	echo
 	echo "Backup of Database Server - ${CONFIG_mysql_dump_host_friendly:-$CONFIG_mysql_dump_host}"
 	( IFS=,; echo "Databases - ${CONFIG_db_names[*]}" )
 	( IFS=,; echo "Databases (monthly) - ${CONFIG_db_month_names[*]}" )
@@ -1849,7 +1938,7 @@ method_backup () {
 		echo "Backup local files. Doing this weekly on CONFIG_do_weekly."
 		echo
 		backup_local_files "${CONFIG_backup_dir}/backup_local_files/bcf_weekly_${datetimestamp}_${date_weekno}.tar"
-		tmp_flags=$?; var=; 
+		tmp_flags=$?; var=;
 		if (( $? == 0 )); then
 		  echo "success!"
 		  backupfiles=( "${backupfiles[@]}" "${CONFIG_backup_dir}/backup_local_files/bcf_weekly_${datetimestamp}_${date_weekno}.tar" )
@@ -1923,7 +2012,7 @@ method_backup () {
 		echo
 		echo "======================================================================"
 		echo
-	  
+
 	fi
 	# <- dump full schema
 
@@ -1987,7 +2076,7 @@ method_backup () {
 		echo
 		echo "======================================================================"
 		echo
-	  
+
 	fi
 	# <- dump status
 
@@ -2093,9 +2182,9 @@ method_backup () {
 	# -> finished information
 	echo "Total disk space used for backup storage..."
 	echo "Size - Location"
-	
+
 	echo `du ${du_opts} "${CONFIG_backup_dir}"`
-	
+
 	echo
 	echo "======================================================================"
 	# <- finished information
@@ -2130,6 +2219,8 @@ method_list_manifest_entries () {
 	let "filename_flag_gz=0x02"
 	let "filename_flag_bz2=0x04"
 	let "filename_flag_diff=0x08"
+	let "filename_flag_xz=0x10"
+	let "filename_flag_zst=0x20"
 
 	##############################################################################################################
 	# BEGIN __STARTUP
@@ -2141,10 +2232,10 @@ method_list_manifest_entries () {
 
 	# load mysql commands
 	mysql_commands
-	
+
 	export LC_ALL=C
 	PROGNAME=`basename $0`
-	PATH=${PATH}:/usr/local/bin:/usr/bin:/bin:/usr/local/mysql/bin 
+	PATH=${PATH}:/usr/local/bin:/usr/bin:/bin:/usr/local/mysql/bin
 	version=3.0
 	fields=5 # manifest fields
 
@@ -2155,7 +2246,7 @@ method_list_manifest_entries () {
 	# BEGIN __MAIN
 	unset manifest_files manifest_files_db i db
 	while IFS= read -r -d '' file; do
-	  db="${file#/var/backup/db/@(daily|monthly|weekly|latest)/}";
+	  db="${file#/var/backups/db/@(daily|monthly|weekly|latest)/}";
 	  db="${db%/Manifest}";
 	  manifest_files_db[i]="$db"
 	  manifest_files[i++]="$file"
@@ -2228,6 +2319,7 @@ method_list_manifest_entries () {
 				  re=".*\.gz.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_gz"
 				  re=".*\.bz2.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_bz2"
 				  re=".*\.xz.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_xz"
+				  re=".*\.zst.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_zst"
 				  re=".*\.diff.*";	[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_diff"
 				  if (( $master_flags & $filename_flag_gz )); then
 					declare -a testarray=("${to_rm[@]}")
@@ -2250,6 +2342,13 @@ method_list_manifest_entries () {
 					  to_rm=("${to_rm[@]}" "${master%.xz}")
 					fi
 					master="${master%.xz}"
+				  elif (( $master_flags & $filename_flag_zst )); then
+					declare -a testarray=("${to_rm[@]}")
+					if ! in_array "${master%.zst}"; then
+					  zstd_compression -dc "$master" > "${master%.zst}"
+					  to_rm=("${to_rm[@]}" "${master%.zst}")
+					fi
+					master="${master%.zst}"
 				  else
 					:
 				  fi
@@ -2291,6 +2390,7 @@ method_diff_to_full() {
 	re=".*\.gz.*";		[[ "$FileExt" =~ $re ]] && let "diff_flags|=$filename_flag_gz"
 	re=".*\.bz2.*";		[[ "$FileExt" =~ $re ]] && let "diff_flags|=$filename_flag_bz2"
 	re=".*\.xz.*";		[[ "$FileExt" =~ $re ]] && let "diff_flags|=$filename_flag_xz"
+	re=".*\.zst.*";		[[ "$FileExt" =~ $re ]] && let "diff_flags|=$filename_flag_zst"
 	re=".*\.diff.*";	[[ "$FileExt" =~ $re ]] && let "diff_flags|=$filename_flag_diff"
 	FileStub="${master%.@(sql|master)*}"
 	FileExt="${master#"$FileStub"}"
@@ -2298,6 +2398,7 @@ method_diff_to_full() {
 	re=".*\.gz.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_gz"
 	re=".*\.bz2.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_bz2"
 	re=".*\.xz.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_xz"
+	re=".*\.zst.*";		[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_zst"
 	re=".*\.diff.*";	[[ "$FileExt" =~ $re ]] && let "master_flags|=$filename_flag_diff"
 
 	# TODO: Differential backup with encryption is not yet implemented!
@@ -2321,6 +2422,10 @@ method_diff_to_full() {
 	  xz_compression -dc "$diff" > "${diff%.xz}"
 	  to_rm=("${to_rm[@]}" "${diff%.xz}")
 	  diff="${diff%.xz}"
+	elif (( $diff_flags & $filename_flag_zst )); then
+	  zstd_compression -dc "$diff" > "${diff%.zst}"
+	  to_rm=("${to_rm[@]}" "${diff%.zst}")
+	  diff="${diff%.zst}"
 	else
 	  :
 	fi
@@ -2333,10 +2438,14 @@ method_diff_to_full() {
 	  bzip2_compression -dc "$master" > "${master%.bz2}"
 	  to_rm=("${to_rm[@]}" "${master%.bz2}")
 	  master="${master%.bz2}"
-	elif (( $master_flags & $filename_flag_bz2 )); then
+	elif (( $master_flags & $filename_flag_xz )); then
 	  xz_compression -dc "$master" > "${master%.xz}"
 	  to_rm=("${to_rm[@]}" "${master%.xz}")
 	  master="${master%.xz}"
+	elif (( $master_flags & $filename_flag_zst )); then
+	  zstd_compression -dc "$master" > "${master%.zst}"
+	  to_rm=("${to_rm[@]}" "${master%.zst}")
+	  master="${master%.zst}"
 	else
 	  :
 	fi
